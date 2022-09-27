@@ -9,6 +9,14 @@ import cv2
 import imutils
 
 
+import torch
+import os
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from typing import Optional, Tuple
+from tqdm.auto import tqdm
+from model import MattingNetwork
+
 class VideoWriter:
     def __init__(self, path, frame_rate=25, bit_rate=1000000):
         self.container = av.open(path, mode='w')
@@ -44,7 +52,7 @@ def video_upload():
         frame_width = int(video.get(3))
         frame_height = int(video.get(4))
         writer = cv2.VideoWriter('out' + vid_name,
-                                 cv2.VideoWriter_fourcc(*'avc3'),
+                                 cv2.VideoWriter_fourcc(*'mp4v'),
                                  25.0, (frame_width, frame_height))
 
         progress_bar = st.progress(0)
@@ -64,6 +72,7 @@ def video_upload():
         st.subheader('Conversion of processed video to playable format...')
         subprocess.call(args=f"ffmpeg -y -i {'out'+vid_name} -c:v libx264 {convertedVideo}".split(" "))
 
+        # video_file = open('out' + vid_name, 'rb')
         video_file = open(convertedVideo, 'rb')
         video_bytes = video_file.read()
         st.video(video_bytes)
@@ -87,8 +96,13 @@ def webcam_input(style_model_name):
             self._model_lock = threading.Lock()
 
             self._width = WIDTH
+            self._transform = transforms.ToTensor()
+            self._device = 'cuda'
+            self._model = None
+            self._rec = [None] * 4
+            self._downsample_ratio = None
             self._update_model()
-            self._model = 3 #self._get_model_from_path(style_model_path)
+            self._bgr = torch.tensor([120, 255, 155], device=self._device, dtype=torch.float32).div(255).view(1, 1, 3, 1, 1)
 
         def set_width(self, width):
             update_needed = self._width != width
@@ -97,11 +111,17 @@ def webcam_input(style_model_name):
                 self._update_model()
 
         def _update_model(self):
-            pass
-            # TODO read model from path
-            # style_model_path = style_models_dict[self._model_name]
-            # with self._model_lock:
-            #     self._model = get_model_from_path(style_model_path)
+            variant = 'mobilenetv3'
+            checkpoint = 'rvm_mobilenetv3.pth'
+            with self._model_lock:
+                self._model = MattingNetwork(variant).eval().to(self._device )
+                self._model.load_state_dict(torch.load(checkpoint, map_location=self._device ))
+                self._model = torch.jit.script(self._model)
+                self._model = torch.jit.freeze(self._model)
+                self._model = self._model.eval()
+                self._rec = [None] * 4
+                torch.set_grad_enabled(False)
+                self._downsample_ratio = None
 
         def transform(self, frame):
             image = frame.to_ndarray(format="bgr24")
@@ -109,17 +129,28 @@ def webcam_input(style_model_name):
             if self._model == None:
                 return image
 
-            orig_h, orig_w = image.shape[0:2]
-
-            # cv2.resize used in a forked thread may cause memory leaks
-            input = np.asarray(Image.fromarray(image).resize((self._width, int(self._width * orig_h / orig_w))))
+            orig_h, orig_w = image.shape[:2]
 
             with self._model_lock:
-                transferred = input[::-1, :, :]
-                # TODO implement matting here
+                if self._downsample_ratio is None:
+                    self._downsample_ratio = auto_downsample_ratio(orig_h, orig_w)
 
-            result = Image.fromarray((transferred * 255).astype(np.uint8))
+
+                image = self._transform(image)
+                # print(image.shape)
+                image = image.to(self._device, torch.float32, non_blocking=True).unsqueeze(0) # [B, T, C, H, W]
+                # print(image.shape)
+                fgr, pha, *self._rec = self._model(image, *self._rec, self._downsample_ratio)
+                final_arr = fgr * pha + self._bgr * (1 - pha)
+                # print(final_arr.shape)
+                final_arr = final_arr[0].mul(255).byte().cpu().permute(0, 2, 3, 1).numpy().astype(np.uint8)
+                # print(final_arr.shape)
+
+            result = Image.fromarray(final_arr[0])
             return np.asarray(result.resize((orig_w, orig_h)))
+
+    def auto_downsample_ratio(h, w):
+        return min(512 / max(h, w), 1)
 
     ctx = webrtc_streamer(
         client_settings=ClientSettings(
