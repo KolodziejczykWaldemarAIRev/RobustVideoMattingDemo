@@ -93,7 +93,8 @@ def video_upload():
 
 def webcam_input():
     st.header("Webcam Live Feed")
-    WIDTH = st.sidebar.select_slider('QUALITY (May reduce the speed)', list(range(50, 501, 50)))
+    WIDTH_RATIO = st.sidebar.select_slider('QUALITY [%] (May reduce the speed/quality)', list(range(10, 101, 10)))
+    WIDTH = WIDTH_RATIO * 5
 
     def auto_downsample_ratio(h, w, target_width = 512):
         return min(target_width / max(h, w), 1)
